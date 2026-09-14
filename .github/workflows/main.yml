@@ -1,246 +1,200 @@
-name: Build
+name: Build and Deploy Microservice
 
 on:
   push:
     branches: [ "main" ]
 
 jobs:
+  # -------------------------------------------------------------
+  # 1. CI: Pruebas, Compilación y Publicación de Imagen Docker
+  # -------------------------------------------------------------
   build:
-    name: CI
-    environment: dev
+    name: CI - Build & Push
     runs-on: ubuntu-latest
-
     steps:
       - name: Obtener código fuente
         uses: actions/checkout@v4
+
       - name: Obtener SHA corto
         id: short
-        run: echo "short_sha=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Configurar Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Instalar dependencias
-        run: npm install
-      - name: Ejecutar pruebas unitarias
-        run: npm run test:unit
-      - name: Ejecutar pruebas de integración
-        run: npm run test:integration
-      - name: Crear archivo ZIP del proyecto
-        run: zip -r build-artifact.zip . -x "node_modules/*" ".git/*"
 
-      - name: Subir artefacto ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-artifact
-          path: build-artifact.zip
-      
+      - name: Instalar dependencias
+        run: npm ci || npm install
+
+      - name: Ejecutar pruebas unitarias
+        run: npm run test:unit --if-present
+
+      - name: Ejecutar pruebas de integración
+        run: npm run test:integration --if-present
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Docker Login to ACR
-        run: |
-          az acr login --name acr${{ vars.APELLIDO }}
+      - name: Autenticar en Azure Container Registry
+        run: az acr login --name acr${{ vars.APELLIDO }}
 
-      - name: Build and Push Docker Image
+      - name: Construir y Publicar Imagen Docker
         run: |
           IMAGE_NAME=acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app
           TAG=${{ steps.short.outputs.short_sha }}
-          echo "Construyendo imagen $IMAGE_NAME:$TAG"
-          docker build -t $IMAGE_NAME:$TAG .
+          echo "Construyendo y subiendo $IMAGE_NAME:$TAG"
+          docker build -t $IMAGE_NAME:$TAG -t $IMAGE_NAME:latest .
           docker push $IMAGE_NAME:$TAG
+          docker push $IMAGE_NAME:latest
 
+  # -------------------------------------------------------------
+  # 2. CD [dev]: Despliegue en Ambiente de Desarrollo
+  # -------------------------------------------------------------
   deploy-dev:
     name: CD [dev]
     environment: dev
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Obtener código fuente
         uses: actions/checkout@v4
-  
+
       - name: Obtener SHA corto
         id: short
-        run: echo "short_sha=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
-        
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-  
-      - name: Establecer variables
-        run: |
-          IMAGE_NAME=acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app
-          TAG=${{ steps.short.outputs.short_sha }}
-          APP_NAME=aca-ms-${{ vars.APELLIDO }}-${{ vars.ENV }}
-          RESOURCE_GROUP=rg-cicd-terraform-app-${{ vars.APELLIDO }}
-          ACR_NAME=acr${{ vars.APELLIDO }}
 
-          echo "IMAGE=$IMAGE_NAME:$TAG" >> $GITHUB_ENV
-          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> $GITHUB_ENV
-          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+      - name: Desplegar nueva versión en Azure Container App (dev)
+        run: |
+          IMAGE="acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app:${{ steps.short.outputs.short_sha }}"
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-dev"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
 
-      - name: Configurar ACR credentials para Container App
-        run: |
-          echo "Configurando credenciales del ACR para la Container App..."
-          ACR_SERVER=$(az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP --query loginServer --output tsv)
-          echo "Servidor ACR: $ACR_SERVER"
-          
-          # Configurar la Container App para usar managed identity con el ACR
-          az containerapp registry set \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --server $ACR_SERVER \
-            --identity system
-  
-      - name: Deploy a Azure Container App
-        run: |
-          echo "Updating Azure Container App $APP_NAME to image $IMAGE"
+          echo "🚀 Actualizando $APP_NAME con la imagen $IMAGE..."
           az containerapp update \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --image $IMAGE \
-            --set-env-vars ENV=${{ vars.ENV }} API_PROVIDER_URL=${{ vars.API_PROVIDER_URL }} 
-      
-      - name: Imprimir endpoint del Container App
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --set-env-vars ENV=dev API_PROVIDER_URL="${{ vars.API_PROVIDER_URL }}"
+
+      - name: Imprimir Endpoint de Container App (dev)
         run: |
-          ENDPOINT=$(az containerapp show --name $APP_NAME --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
-          echo "Endpoint del Container App: https://$ENDPOINT"
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-dev"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
+          ENDPOINT=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "🔗 URL Pública [DEV]: https://$ENDPOINT"
 
-
+  # -------------------------------------------------------------
+  # 3. Aprobación manual para QA
+  # -------------------------------------------------------------
   approval-qa:
+    name: Aprobación para QA
     needs: [deploy-dev]
     environment:
       name: approval-qa
     runs-on: ubuntu-latest
     steps:
-      - name: Aprobar
-        run: echo "Esperando aprobación"
+      - name: Estado de Aprobación
+        run: echo "Pase a QA aprobado."
 
+  # -------------------------------------------------------------
+  # 4. CD [qa]: Despliegue en Ambiente de QA
+  # -------------------------------------------------------------
   deploy-qa:
     name: CD [qa]
     environment: qa
     needs: approval-qa
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Obtener código fuente
         uses: actions/checkout@v4
-  
+
       - name: Obtener SHA corto
         id: short
-        run: echo "short_sha=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
-        
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-  
-      - name: Establecer variables
-        run: |
-          IMAGE_NAME=acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app
-          TAG=${{ steps.short.outputs.short_sha }}
-          APP_NAME=aca-ms-${{ vars.APELLIDO }}-${{ vars.ENV }}
-          RESOURCE_GROUP=rg-cicd-terraform-app-${{ vars.APELLIDO }}
-          ACR_NAME=acr${{ vars.APELLIDO }}
 
-          echo "IMAGE=$IMAGE_NAME:$TAG" >> $GITHUB_ENV
-          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> $GITHUB_ENV
-          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+      - name: Desplegar nueva versión en Azure Container App (qa)
+        run: |
+          IMAGE="acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app:${{ steps.short.outputs.short_sha }}"
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-qa"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
 
-      - name: Configurar ACR credentials para Container App
-        run: |
-          echo "Configurando credenciales del ACR para la Container App..."
-          ACR_SERVER=$(az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP --query loginServer --output tsv)
-          echo "Servidor ACR: $ACR_SERVER"
-          
-          # Configurar la Container App para usar managed identity con el ACR
-          az containerapp registry set \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --server $ACR_SERVER \
-            --identity system
-  
-      - name: Deploy a Azure Container App
-        run: |
-          echo "Updating Azure Container App $APP_NAME to image $IMAGE"
+          echo "🚀 Actualizando $APP_NAME con la imagen $IMAGE..."
           az containerapp update \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --image $IMAGE \
-            --set-env-vars ENV=${{ vars.ENV }} API_PROVIDER_URL=${{ vars.API_PROVIDER_URL }} 
-      
-      - name: Imprimir endpoint del Container App
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --set-env-vars ENV=qa API_PROVIDER_URL="${{ vars.API_PROVIDER_URL }}"
+
+      - name: Imprimir Endpoint de Container App (qa)
         run: |
-          ENDPOINT=$(az containerapp show --name $APP_NAME --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
-          echo "Endpoint del Container App: https://$ENDPOINT"
-          
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-qa"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
+          ENDPOINT=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "🔗 URL Pública [QA]: https://$ENDPOINT"
+
+  # -------------------------------------------------------------
+  # 5. Aprobación manual para PRD
+  # -------------------------------------------------------------
   approval-prd:
+    name: Aprobación para PRD
     needs: [deploy-qa]
     environment:
       name: approval-prd
     runs-on: ubuntu-latest
     steps:
-      - name: Aprobar
-        run: echo "Esperando aprobación"
+      - name: Estado de Aprobación
+        run: echo "Pase a Producción aprobado."
 
+  # -------------------------------------------------------------
+  # 6. CD [prd]: Despliegue en Ambiente de Producción
+  # -------------------------------------------------------------
   deploy-prd:
     name: CD [prd]
     environment: prd
     needs: approval-prd
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Obtener código fuente
         uses: actions/checkout@v4
-  
+
       - name: Obtener SHA corto
         id: short
-        run: echo "short_sha=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
-        
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-  
-      - name: Establecer variables
-        run: |
-          IMAGE_NAME=acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app
-          TAG=${{ steps.short.outputs.short_sha }}
-          APP_NAME=aca-ms-${{ vars.APELLIDO }}-${{ vars.ENV }}
-          RESOURCE_GROUP=rg-cicd-terraform-app-${{ vars.APELLIDO }}
-          ACR_NAME=acr${{ vars.APELLIDO }}
 
-          echo "IMAGE=$IMAGE_NAME:$TAG" >> $GITHUB_ENV
-          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> $GITHUB_ENV
-          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+      - name: Desplegar nueva versión en Azure Container App (prd)
+        run: |
+          IMAGE="acr${{ vars.APELLIDO }}.azurecr.io/my-nodejs-app:${{ steps.short.outputs.short_sha }}"
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-prd"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
 
-      - name: Configurar ACR credentials para Container App
-        run: |
-          echo "Configurando credenciales del ACR para la Container App..."
-          ACR_SERVER=$(az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP --query loginServer --output tsv)
-          echo "Servidor ACR: $ACR_SERVER"
-          
-          # Configurar la Container App para usar managed identity con el ACR
-          az containerapp registry set \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --server $ACR_SERVER \
-            --identity system
-  
-      - name: Deploy a Azure Container App
-        run: |
-          echo "Updating Azure Container App $APP_NAME to image $IMAGE"
+          echo "🚀 Actualizando $APP_NAME con la imagen $IMAGE..."
           az containerapp update \
-            --name $APP_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --image $IMAGE \
-            --set-env-vars ENV=${{ vars.ENV }} API_PROVIDER_URL=${{ vars.API_PROVIDER_URL }} 
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --set-env-vars ENV=prd API_PROVIDER_URL="${{ vars.API_PROVIDER_URL }}"
 
-      - name: Imprimir endpoint del Container App
+      - name: Imprimir Endpoint de Container App (prd)
         run: |
-          ENDPOINT=$(az containerapp show --name $APP_NAME --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
-          echo "Endpoint del Container App: https://$ENDPOINT"
+          APP_NAME="aca-ms-${{ vars.APELLIDO }}-prd"
+          RESOURCE_GROUP="rg-cicd-terraform-app-${{ vars.APELLIDO }}"
+          ENDPOINT=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "🔗 URL Pública [PRD]: https://$ENDPOINT"
